@@ -40,8 +40,6 @@
 
 #define	MB (1024L * 1024L)
 
-static char mem_pool[VMEM_MIN_POOL];
-
 int
 main(int argc, char *argv[])
 {
@@ -56,6 +54,10 @@ main(int argc, char *argv[])
 	}
 
 	if (dir == NULL) {
+		/* allocate memory for function vmem_pool_create_in_region() */
+		void *mem_pool = MMAP(NULL, VMEM_MIN_POOL, PROT_READ|PROT_WRITE,
+					MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+
 		vmp = vmem_pool_create_in_region(mem_pool, VMEM_MIN_POOL);
 		if (vmp == NULL)
 			FATAL("!vmem_pool_create_in_region");
@@ -77,8 +79,6 @@ main(int argc, char *argv[])
 		size_t space = vmem_pool_freespace(vmp);
 		/* free space can only decrease */
 		ASSERT(space <= free_space);
-		/* calculate free space in steps smaller than 1MB */
-		ASSERT(free_space - space < 1L * MB);
 		free_space = space;
 	}
 
@@ -93,14 +93,18 @@ main(int argc, char *argv[])
 		size_t space = vmem_pool_freespace(vmp);
 		/* free space can only increase */
 		ASSERT(space >= free_space);
-		/* calculate free space in steps smaller than 1MB */
-		ASSERT(space - free_space < 1L * MB);
 		free_space = space;
 	}
 
 	free_space = vmem_pool_freespace(vmp);
-	/* max 10% of memory can be wasted on internal data */
-	ASSERT(free_space > (total_space * 9) / 10);
+
+	/*
+	 * Depending on the distance of the 'mem_pool' from the
+	 * chunk alignment (4MB) a different size of free memory
+	 * will be wasted on base_alloc inside jemalloc.
+	 * Rest of the internal data should not waste more than 10% of space.
+	 */
+	ASSERT(free_space > ((total_space - 4L * MB) * 9) / 10);
 
 	vmem_pool_delete(vmp);
 

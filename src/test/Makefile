@@ -68,7 +68,8 @@ TEST = blk_nblock\
        vmem_realloc\
        vmem_stats\
        vmem_strdup\
-       vmem_valgrind
+       vmem_valgrind\
+       vmem_pages_purging
 
 all     : TARGET = all
 clean   : TARGET = clean

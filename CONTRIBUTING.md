@@ -9,7 +9,7 @@ There are several good ways to suggest new features, offer to add a feature,
 or just begin a dialog about the NVM Library:
 
 * Open an issue in our [GitHub Issues Database](https://github.com/pmem/issues/issues)
-* Suggest a feature, ask a question, start a discussion, etc. in our [pmem Google goup](http://groups.google.com/group/pmem)
+* Suggest a feature, ask a question, start a discussion, etc. in our [pmem Google group](http://groups.google.com/group/pmem)
 * Chat with members of the NVM Library team real-time on the **#pmem** IRC channel on [OFTC](http://www.oftc.net)
 
 **NOTE: If you do decide to implement code changes and contribute them,
@@ -61,7 +61,7 @@ Assign the `Type: Bug` label to the issue
 
 Optionally, assign one of the Priority labels (P1, P2, ...).
 The Priority attribute describes the urgency to resolve a defect
-and establishes the timeframe for providing a verified resolution.
+and establishes the time frame for providing a verified resolution.
 These Priority labels are defined as:
 
 * **P1**: Showstopper bug, requiring resolution before the next release of the library.

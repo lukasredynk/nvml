@@ -1,3 +1,4 @@
+#!/bin/bash -e
 #
 # Copyright (c) 2014, Intel Corporation
 #
@@ -31,17 +32,23 @@
 #
 
 #
-# benchmarks/mt/Makefile -- build multi-threading scaling benchmark
+# src/test/vmem_pages_purging/TEST0 -- unit test for vmem_pages_purging
 #
-TARGET = benchmark_mt
-VMEM_PATH=../../src/nondebug/
+# This test covers the issue related to zeroing pages mapped to
+# underlying file.
 
-OBJS = mt.o tasks.o
+export UNITTEST_NAME=vmem_pages_purging/TEST1
+export UNITTEST_NUM=1
 
-include ../Makefile.inc
+# standard unit test setup
+. ../unittest/unittest.sh
 
-LIBS := -Wl,-rpath,$(VMEM_PATH) -L$(VMEM_PATH) -lvmem -lpthread
-INCS := -I../../src/include/ -I.
+require_fs_type local pmem
 
-mt.o: mt.c
-tasks.o: tasks.c tasks.h
+setup
+
+expect_normal_exit ./vmem_pages_purging$EXESUFFIX -z $DIR
+
+check
+
+pass

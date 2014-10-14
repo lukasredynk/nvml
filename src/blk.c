@@ -117,9 +117,9 @@ nsread(void *ns, int lane, void *buf, size_t count, off_t off)
 
 	LOG(13, "pbp %p lane %d count %zu off %zu", pbp, lane, count, off);
 
-	if (off + count >= pbp->datasize) {
+	if (off + count > pbp->datasize) {
 		LOG(1, "offset + count (%zu) past end of data area (%zu)",
-				off + count, pbp->datasize - 1);
+				off + count, pbp->datasize);
 		errno = EINVAL;
 		return -1;
 	}
@@ -142,9 +142,9 @@ nswrite(void *ns, int lane, const void *buf, size_t count, off_t off)
 
 	LOG(13, "pbp %p lane %d count %zu off %zu", pbp, lane, count, off);
 
-	if (off + count >= pbp->datasize) {
+	if (off + count > pbp->datasize) {
 		LOG(1, "offset + count (%zu) past end of data area (%zu)",
-				off + count, pbp->datasize - 1);
+				off + count, pbp->datasize);
 		errno = EINVAL;
 		return -1;
 	}
@@ -406,7 +406,7 @@ pmemblk_map_common(int fd, size_t bsize, int rdonly)
 	 * If possible, turn off all permissions on the pool header page.
 	 *
 	 * The prototype PMFS doesn't allow this when large pages are in
-	 * use not it is not considered an error if this fails.
+	 * use. It is not considered an error if this fails.
 	 */
 	util_range_none(addr, sizeof (struct pool_hdr));
 

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -e
 #
 # Copyright (c) 2014, Intel Corporation
 #
@@ -187,6 +187,9 @@ EOF
 [ -f $CHANGELOG_FILE ] && convert_changelog $CHANGELOG_FILE >> $RPM_SPEC_FILE
 
 tar zcf $PACKAGE_TARBALL $PACKAGE_SOURCE
+
+# Create directory structure for rpmbuild
+mkdir -v BUILD SPECS
 
 rpmbuild --define "_topdir `pwd`"\
          --define "_rpmdir ${OUT_DIR}"\
