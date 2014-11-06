@@ -50,39 +50,24 @@
 #include <pthread.h>
 #include <endian.h>
 #include <libpmem.h>
-
-#include "pmem.h"
+#include <libpmemblk.h>
 #include "util.h"
 #include "out.h"
 #include "btt.h"
 #include "blk.h"
 
 /*
- * blk_init -- (internal) load-time initialization for blk
- *
- * Called automatically by the run-time loader.
- */
-__attribute__((constructor))
-static void
-blk_init(void)
-{
-	out_init(LOG_PREFIX, LOG_LEVEL_VAR, LOG_FILE_VAR);
-	LOG(3, NULL);
-	util_init();
-}
-
-/*
  * lane_enter -- (internal) acquire a unique lane number
  */
 static int
-lane_enter(PMEMblk *pbp)
+lane_enter(PMEMblkpool *pbp)
 {
 	int mylane;
 
 	mylane = __sync_fetch_and_add(&pbp->next_lane, 1) % pbp->nlane;
 
 	/* lane selected, grab the per-lane lock */
-	if (pthread_mutex_lock(&pbp->locks[mylane]) < 0) {
+	if ((errno = pthread_mutex_lock(&pbp->locks[mylane]))) {
 		LOG(1, "!pthread_mutex_lock");
 		return -1;
 	}
@@ -93,15 +78,13 @@ lane_enter(PMEMblk *pbp)
 /*
  * lane_exit -- (internal) drop lane lock
  */
-static int
-lane_exit(PMEMblk *pbp, int mylane)
+static void
+lane_exit(PMEMblkpool *pbp, int mylane)
 {
-	if (pthread_mutex_unlock(&pbp->locks[mylane]) < 0) {
+	int oerrno = errno;
+	if ((errno = pthread_mutex_unlock(&pbp->locks[mylane])))
 		LOG(1, "!pthread_mutex_unlock");
-		return -1;
-	}
-
-	return 0;
+	errno = oerrno;
 }
 
 /*
@@ -115,11 +98,12 @@ nsread(void *ns, int lane, void *buf, size_t count, off_t off)
 {
 	struct pmemblk *pbp = (struct pmemblk *)ns;
 
-	LOG(13, "pbp %p lane %d count %zu off %zu", pbp, lane, count, off);
+	LOG(13, "pbp %p lane %d count %zu off %lld",
+			pbp, lane, count, (long long)off);
 
 	if (off + count > pbp->datasize) {
-		LOG(1, "offset + count (%zu) past end of data area (%zu)",
-				off + count, pbp->datasize);
+		LOG(1, "offset + count (%lld) past end of data area (%zu)",
+				(long long)off + count, pbp->datasize);
 		errno = EINVAL;
 		return -1;
 	}
@@ -140,11 +124,12 @@ nswrite(void *ns, int lane, const void *buf, size_t count, off_t off)
 {
 	struct pmemblk *pbp = (struct pmemblk *)ns;
 
-	LOG(13, "pbp %p lane %d count %zu off %zu", pbp, lane, count, off);
+	LOG(13, "pbp %p lane %d count %zu off %lld",
+			pbp, lane, count, (long long)off);
 
 	if (off + count > pbp->datasize) {
-		LOG(1, "offset + count (%zu) past end of data area (%zu)",
-				off + count, pbp->datasize);
+		LOG(1, "offset + count (%lld) past end of data area (%zu)",
+				(long long)off + count, pbp->datasize);
 		errno = EINVAL;
 		return -1;
 	}
@@ -153,8 +138,10 @@ nswrite(void *ns, int lane, const void *buf, size_t count, off_t off)
 
 #ifdef DEBUG
 	/* grab debug write lock */
-	if (pthread_mutex_lock(&pbp->write_lock))
+	if ((errno = pthread_mutex_lock(&pbp->write_lock))) {
 		LOG(1, "!pthread_mutex_lock");
+		return -1;
+	}
 #endif
 
 	/* unprotect the memory (debug version only) */
@@ -167,11 +154,14 @@ nswrite(void *ns, int lane, const void *buf, size_t count, off_t off)
 
 #ifdef DEBUG
 	/* release debug write lock */
-	if (pthread_mutex_unlock(&pbp->write_lock))
+	if ((errno = pthread_mutex_unlock(&pbp->write_lock)))
 		LOG(1, "!pthread_mutex_unlock");
 #endif
 
-	libpmem_persist(pbp->is_pmem, dest, count);
+	if (pbp->is_pmem)
+		pmem_persist(dest, count);
+	else
+		pmem_msync(dest, count);
 
 	return 0;
 }
@@ -191,11 +181,12 @@ nsmap(void *ns, int lane, void **addrp, size_t len, off_t off)
 {
 	struct pmemblk *pbp = (struct pmemblk *)ns;
 
-	LOG(12, "pbp %p lane %d len %zu off %zu", pbp, lane, len, off);
+	LOG(12, "pbp %p lane %d len %zu off %lld",
+			pbp, lane, len, (long long)off);
 
 	if (off + len >= pbp->datasize) {
-		LOG(1, "offset + len (%zu) past end of data area (%zu)",
-				off + len, pbp->datasize - 1);
+		LOG(1, "offset + len (%lld) past end of data area (%zu)",
+				(long long)off + len, pbp->datasize - 1);
 		errno = EINVAL;
 		return -1;
 	}
@@ -229,7 +220,10 @@ nssync(void *ns, int lane, void *addr, size_t len)
 
 	LOG(12, "pbp %p lane %d addr %p len %zu", pbp, lane, addr, len);
 
-	libpmem_persist(pbp->is_pmem, addr, len);
+	if (pbp->is_pmem)
+		pmem_persist(addr, len);
+	else
+		pmem_msync(addr, len);
 }
 
 /* callbacks for btt_init() */
@@ -241,7 +235,7 @@ static const struct ns_callback ns_cb = {
 };
 
 /*
- * pmemblk_map_common -- (internal) map a block memory pool
+ * pmemblk_pool_open_common -- (internal) open a block memory pool
  *
  * This routine does all the work, but takes a rdonly flag so internal
  * calls can map a read-only pool if required.
@@ -249,31 +243,41 @@ static const struct ns_callback ns_cb = {
  * Passing in bsize == 0 means a valid pool header must exist (which
  * will supply the block size).
  */
-static PMEMblk *
-pmemblk_map_common(int fd, size_t bsize, int rdonly)
+static PMEMblkpool *
+pmemblk_pool_open_common(const char *path, size_t bsize, int rdonly)
 {
-	LOG(3, "fd %d bsize %zu rdonly %d", fd, bsize, rdonly);
+	LOG(3, "path %s bsize %zu rdonly %d", path, bsize, rdonly);
 
 	/* things free by "goto err" if not NULL */
-	void *addr = NULL;
 	struct btt *bttp = NULL;
 	pthread_mutex_t *locks = NULL;
 
 	struct stat stbuf;
-	if (fstat(fd, &stbuf) < 0) {
-		LOG(1, "!fstat");
+	if (stat(path, &stbuf) < 0) {
+		LOG(1, "!stat %s", path);
 		return NULL;
 	}
 
 	if (stbuf.st_size < PMEMBLK_MIN_POOL) {
-		LOG(1, "size %zu smaller than %zu",
-				stbuf.st_size, PMEMBLK_MIN_POOL);
+		LOG(1, "size %lld smaller than %zu",
+				(long long)stbuf.st_size, PMEMBLK_MIN_POOL);
 		errno = EINVAL;
 		return NULL;
 	}
 
-	if ((addr = util_map(fd, stbuf.st_size, rdonly)) == NULL)
+	int fd;
+	if ((fd = open(path, O_RDWR)) < 0) {
+		LOG(1, "!open %s", path);
+		return NULL;
+	}
+
+	void *addr;
+	if ((addr = util_map(fd, stbuf.st_size, rdonly)) == NULL) {
+		close(fd);
 		return NULL;	/* util_map() set errno, called LOG */
+	}
+
+	close(fd);
 
 	/* check if the mapped region is located in persistent memory */
 	int is_pmem = pmem_is_pmem(addr, stbuf.st_size);
@@ -345,11 +349,11 @@ pmemblk_map_common(int fd, size_t bsize, int rdonly)
 		hdrp->checksum = htole64(hdrp->checksum);
 
 		/* store pool's header */
-		libpmem_persist(is_pmem, hdrp, sizeof (*hdrp));
+		pmem_msync(hdrp, sizeof (*hdrp));
 
 		/* create rest of required metadata */
 		pbp->bsize = htole32(bsize);
-		libpmem_persist(is_pmem, &pbp->bsize, sizeof (bsize));
+		pmem_msync(&pbp->bsize, sizeof (bsize));
 	}
 
 	/*
@@ -387,7 +391,7 @@ pmemblk_map_common(int fd, size_t bsize, int rdonly)
 	}
 
 	for (int i = 0; i < pbp->nlane; i++)
-		if (pthread_mutex_init(&locks[i], NULL) < 0) {
+		if ((errno = pthread_mutex_init(&locks[i], NULL))) {
 			LOG(1, "!pthread_mutex_init");
 			goto err;
 		}
@@ -396,7 +400,7 @@ pmemblk_map_common(int fd, size_t bsize, int rdonly)
 
 #ifdef DEBUG
 	/* initialize debug lock */
-	if (pthread_mutex_init(&pbp->write_lock, NULL) < 0) {
+	if ((errno = pthread_mutex_init(&pbp->write_lock, NULL))) {
 		LOG(1, "!pthread_mutex_init");
 		goto err;
 	}
@@ -429,21 +433,21 @@ err:
 }
 
 /*
- * pmemblk_map -- map a block memory pool
+ * pmemblk_pool_open -- open a block memory pool
  */
-PMEMblk *
-pmemblk_map(int fd, size_t bsize)
+PMEMblkpool *
+pmemblk_pool_open(const char *path, size_t bsize)
 {
-	LOG(3, "fd %d bsize %zu", fd, bsize);
+	LOG(3, "path %s bsize %zu", path, bsize);
 
-	return pmemblk_map_common(fd, bsize, 0);
+	return pmemblk_pool_open_common(path, bsize, 0);
 }
 
 /*
- * pmemblk_unmap -- unmap a block memory pool
+ * pmemblk_pool_close -- close a block memory pool
  */
 void
-pmemblk_unmap(PMEMblk *pbp)
+pmemblk_pool_close(PMEMblkpool *pbp)
 {
 	LOG(3, "pbp %p", pbp);
 
@@ -466,7 +470,7 @@ pmemblk_unmap(PMEMblk *pbp)
  * pmemblk_nblock -- return number of usable blocks in a block memory pool
  */
 size_t
-pmemblk_nblock(PMEMblk *pbp)
+pmemblk_nblock(PMEMblkpool *pbp)
 {
 	LOG(3, "pbp %p", pbp);
 
@@ -477,9 +481,9 @@ pmemblk_nblock(PMEMblk *pbp)
  * pmemblk_read -- read a block in a block memory pool
  */
 int
-pmemblk_read(PMEMblk *pbp, void *buf, off_t blockno)
+pmemblk_read(PMEMblkpool *pbp, void *buf, off_t blockno)
 {
-	LOG(3, "pbp %p buf %p blockno %zu", pbp, buf, blockno);
+	LOG(3, "pbp %p buf %p blockno %lld", pbp, buf, (long long)blockno);
 
 	int lane = lane_enter(pbp);
 
@@ -497,9 +501,9 @@ pmemblk_read(PMEMblk *pbp, void *buf, off_t blockno)
  * pmemblk_write -- write a block (atomically) in a block memory pool
  */
 int
-pmemblk_write(PMEMblk *pbp, const void *buf, off_t blockno)
+pmemblk_write(PMEMblkpool *pbp, const void *buf, off_t blockno)
 {
-	LOG(3, "pbp %p buf %p blockno %zu", pbp, buf, blockno);
+	LOG(3, "pbp %p buf %p blockno %lld", pbp, buf, (long long)blockno);
 
 	if (pbp->rdonly) {
 		LOG(1, "EROFS (pool is read-only)");
@@ -523,9 +527,9 @@ pmemblk_write(PMEMblk *pbp, const void *buf, off_t blockno)
  * pmemblk_set_zero -- zero a block in a block memory pool
  */
 int
-pmemblk_set_zero(PMEMblk *pbp, off_t blockno)
+pmemblk_set_zero(PMEMblkpool *pbp, off_t blockno)
 {
-	LOG(3, "pbp %p blockno %zu", pbp, blockno);
+	LOG(3, "pbp %p blockno %lld", pbp, (long long)blockno);
 
 	if (pbp->rdonly) {
 		LOG(1, "EROFS (pool is read-only)");
@@ -549,9 +553,9 @@ pmemblk_set_zero(PMEMblk *pbp, off_t blockno)
  * pmemblk_set_error -- set the error state on a block in a block memory pool
  */
 int
-pmemblk_set_error(PMEMblk *pbp, off_t blockno)
+pmemblk_set_error(PMEMblkpool *pbp, off_t blockno)
 {
-	LOG(3, "pbp %p blockno %zu", pbp, blockno);
+	LOG(3, "pbp %p blockno %lld", pbp, (long long)blockno);
 
 	if (pbp->rdonly) {
 		LOG(1, "EROFS (pool is read-only)");
@@ -572,30 +576,22 @@ pmemblk_set_error(PMEMblk *pbp, off_t blockno)
 }
 
 /*
- * pmemblk_check -- block memory pool consistency check
+ * pmemblk_pool_check -- block memory pool consistency check
  */
 int
-pmemblk_check(const char *path)
+pmemblk_pool_check(const char *path)
 {
 	LOG(3, "path \"%s\"", path);
 
-	int fd = open(path, O_RDWR);
-
-	if (fd < 0) {
-		LOG(1, "!open");
-		return -1;
-	}
-
 	/* open the pool read-only */
-	PMEMblk *pbp = pmemblk_map_common(fd, 0, 1);
-	close(fd);
+	PMEMblkpool *pbp = pmemblk_pool_open_common(path, 0, 1);
 
 	if (pbp == NULL)
-		return -1;	/* errno set by pmemblk_map_common() */
+		return -1;	/* errno set by pmemblk_pool_open_common() */
 
 	int retval = btt_check(pbp->bttp);
 	int oerrno = errno;
-	pmemblk_unmap(pbp);
+	pmemblk_pool_close(pbp);
 	errno = oerrno;
 
 	return retval;

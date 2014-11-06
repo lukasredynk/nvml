@@ -32,22 +32,31 @@
 #
 
 #
-# src/test/scope/TEST6 -- scope test to check libpmem symbols (nondebug)
+# src/test/blk_rw/TEST6 -- unit test for pmemblk_read/write/set_zero/set_error
 #
-export UNITTEST_NAME=scope/TEST6
+export UNITTEST_NAME=blk_rw/TEST6
 export UNITTEST_NUM=6
 
 # standard unit test setup
 . ../unittest/unittest.sh
 
-require_fs_type local
-require_build_type nondebug
+# doesn't make sense to run in local directory
+require_fs_type pmem non-pmem
 
 setup
 
-(nm -g ../../nondebug/libpmem.a |\
-	perl -ne 'print if s/^[0-9a-z]+ T (\w+)/$1/' |\
-	sort > out6.log) 2> err6.log
+# mix writes with set_zero and set_error and check results
+rm -f $DIR/testfile1
+truncate -s 1G $DIR/testfile1
+expect_normal_exit ./blk_rw$EXESUFFIX 512 $DIR/testfile1\
+		e:1 r:1\
+		e:2 w:2 r:2\
+		z:3 e:3 r:3\
+		e:4 z:4 r:4\
+		w:5 e:5 z:5 r:5\
+		w:6 z:6 e:6 r:6
+
+rm $DIR/testfile1
 
 check
 

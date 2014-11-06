@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, Intel Corporation
+ * Copyright (c) 2014, Intel Corporation
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -51,20 +51,6 @@
 
 #define	PROCMAXLEN 2048 /* maximum expected line length in /proc files */
 
-/* default persist function is pmem_persist() */
-Persist_func Persist = pmem_persist;
-
-/*
- * pmem_set_persist_func -- allow override of persist_func used libpmem
- */
-void
-pmem_set_persist_func(void (*persist_func)(void *addr, size_t len, int flags))
-{
-	LOG(3, "persist %p", persist_func);
-
-	Persist = (persist_func == NULL) ? pmem_persist : persist_func;
-}
-
 /*
  * pmem_drain -- wait for any PM stores to drain from HW buffers
  */
@@ -82,7 +68,7 @@ pmem_drain(void)
  * flush_clflush -- (internal) flush the CPU cache, using clflush
  */
 static void
-flush_clflush(void *addr, size_t len, int flags)
+flush_clflush(void *addr, size_t len)
 {
 	uintptr_t uptr;
 
@@ -99,7 +85,7 @@ flush_clflush(void *addr, size_t len, int flags)
  * flush_clflushopt -- (internal) flush the CPU cache, using clflushopt
  */
 static void
-flush_clflushopt(void *addr, size_t len, int flags)
+flush_clflushopt(void *addr, size_t len)
 {
 	uintptr_t uptr;
 
@@ -128,15 +114,15 @@ flush_clflushopt(void *addr, size_t len, int flags)
  * Func_flush is set to flush_clflushopt().  That's the most common case
  * on modern hardware that supports persistent memory.
  */
-static void (*Func_flush)(void *, size_t, int) = flush_clflush;
+static void (*Func_flush)(void *, size_t) = flush_clflush;
 
 /*
  * pmem_flush -- flush processor cache for the given range
  */
 void
-pmem_flush(void *addr, size_t len, int flags)
+pmem_flush(void *addr, size_t len)
 {
-	(*Func_flush)(addr, len, flags);
+	(*Func_flush)(addr, len);
 }
 
 /*
@@ -149,14 +135,45 @@ pmem_fence(void)
 }
 
 /*
- * pmem_persist -- make any cached changes to a range of PMEM persistent
+ * pmem_persist -- make any cached changes to a range of pmem persistent
  */
 void
-pmem_persist(void *addr, size_t len, int flags)
+pmem_persist(void *addr, size_t len)
 {
-	pmem_flush(addr, len, flags);
+	pmem_flush(addr, len);
 	__builtin_ia32_sfence();
 	pmem_drain();
+}
+
+/*
+ * pmem_msync -- flush to persistence via msync
+ *
+ * Using msync() means this routine is less optimal for pmem (but it
+ * still works) but it also works for any memory mapped file, unlike
+ * pmem_persist() which is only safe where pmem_is_pmem() returns true.
+ */
+int
+pmem_msync(void *addr, size_t len)
+{
+	LOG(5, "addr %p len %zu", addr, len);
+
+	/*
+	 * msync requires len to be a multiple of pagesize, so
+	 * adjust addr and len to represent the full 4k chunks
+	 * covering the given range.
+	 */
+
+	/* increase len by the amount we gain when we round addr down */
+	len += (uintptr_t)addr & (Pagesize - 1);
+
+	/* round addr down to page boundary */
+	uintptr_t uptr = (uintptr_t)addr & ~(Pagesize - 1);
+
+	int ret;
+	if ((ret = msync((void *)uptr, len, MS_SYNC)) < 0)
+		LOG(1, "!msync");
+
+	return ret;
 }
 
 /*
@@ -291,7 +308,7 @@ __attribute__((constructor))
 static void
 pmem_init(void)
 {
-	out_init(LOG_PREFIX, LOG_LEVEL_VAR, LOG_FILE_VAR);
+	out_init(PMEM_LOG_PREFIX, PMEM_LOG_LEVEL_VAR, PMEM_LOG_FILE_VAR);
 	LOG(3, NULL);
 	util_init();
 
@@ -385,4 +402,66 @@ pmem_map(int fd)
 
 	LOG(3, "returning %p", addr);
 	return addr;
+}
+
+/*
+ * pmem_memmove_nodrain -- memmove to pmem without hw drain
+ */
+void *
+pmem_memmove_nodrain(void *pmemdest, const void *src, size_t len)
+{
+	/* XXX stub version */
+	return memmove(pmemdest, src, len);
+}
+
+/*
+ * pmem_memcpy_nodrain -- memcpy to pmem without hw drain
+ */
+void *
+pmem_memcpy_nodrain(void *pmemdest, const void *src, size_t len)
+{
+	return pmem_memmove_nodrain(pmemdest, src, len);
+}
+
+/*
+ * pmem_memset_nodrain -- memset to pmem without hw drain
+ */
+void *
+pmem_memset_nodrain(void *pmemdest, int c, size_t len)
+{
+	/* XXX stub version */
+	return memset(pmemdest, c, len);
+}
+
+/*
+ * pmem_memmove -- memmove to pmem
+ */
+void *
+pmem_memmove(void *pmemdest, const void *src, size_t len)
+{
+	void *retval = pmem_memmove_nodrain(pmemdest, src, len);
+	pmem_drain();
+	return retval;
+}
+
+/*
+ * pmem_memcpy -- memcpy to pmem
+ */
+void *
+pmem_memcpy(void *pmemdest, const void *src, size_t len)
+{
+	void *retval = pmem_memcpy_nodrain(pmemdest, src, len);
+	pmem_drain();
+	return retval;
+}
+
+/*
+ * pmem_memset -- memset to pmem
+ */
+void *
+pmem_memset(void *pmemdest, int c, size_t len)
+{
+	void *retval = pmem_memset_nodrain(pmemdest, c, len);
+	pmem_drain();
+	return retval;
 }
