@@ -56,7 +56,6 @@ libpmem \- persistent memory support library
 .B Partial flushing operations:
 .sp
 .BI "void pmem_flush(void *" addr ", size_t " len );
-.BI "void pmem_fence(void);"
 .BI "void pmem_drain(void);"
 .BI "int pmem_has_hw_drain(void);"
 .sp
@@ -284,13 +283,10 @@ than the
 .BR pmem_persist ()
 function described above.
 .PP
-.nf
 .BI "void pmem_flush(void *" addr ", size_t " len );
-.BI "void pmem_fence(void);"
 .BI "void pmem_drain(void);"
-.fi
 .IP
-These three functions provide partial versions of the
+These functions provide partial versions of the
 .BR pmem_persist ()
 function described above.
 .BR pmem_persist ()
@@ -302,9 +298,6 @@ pmem_persist(void *addr, size_t len)
 {
     /* flush the processor caches */
     pmem_flush(addr, len);
-	
-    /* persistent memory store barrier */
-    pmem_fence();
 	
     /* wait for any pmem stores to drain from HW buffers */
     pmem_drain();
@@ -318,11 +311,25 @@ For example, a program
 that needs to flush several discontiguous ranges can call
 .BR pmem_flush ()
 for each range and then follow up by
-calling the
-.BR pmem_fence ()
-and
+calling
 .BR pmem_drain ()
 once.
+.IP
+NOTE: Some software is designed for custom platforms that obviate the
+need for using PCOMMIT (perhaps the platform issues PCOMMIT on shutdown
+or something similar).  Even in such cases, it is recommended that
+applications using
+.B libpmem
+do not skip the step of calling
+.BR pmem_drain (),
+either directly or by using
+.BR pmem_persist ().
+The recommended way to inhibit use of the PCOMMIT instruction is
+by setting the
+.B PMEM_NO_PCOMMIT
+environment variable as described in the
+.B ENVIRONMENT VARIABLES
+section.
 .PP
 .BI "int pmem_has_hw_drain(void);"
 .IP
@@ -348,11 +355,11 @@ features such as Asynchronous DRAM Refresh (ADR) or something similar.
 The functions in this section provide optimized copying to
 persistent memory.
 .PP
-.nf
 .BI "void *pmem_memmove(void *" pmemdest ", const void *" src ", size_t " len );
+.br
 .BI "void *pmem_memcpy(void *" pmemdest ", const void *" src ", size_t " len );
+.br
 .BI "void *pmem_memset(void *" pmemdest ", int " c ", size_t " len );
-.fi
 .IP
 The
 .BR pmem_memmove (),
@@ -395,11 +402,11 @@ WARNING: Using these functions where
 returns false may not do anything useful.
 Use the normal libc functions in that case.
 .PP
-.nf
 .BI "void *pmem_memmove_nodrain(void *" pmemdest ", const void *" src ", size_t " len );
+.br
 .BI "void *pmem_memcpy_nodrain(void *" pmemdest ", const void *" src ", size_t " len );
+.br
 .BI "void *pmem_memset_nodrain(void *" pmemdest ", int " c ", size_t " len );
-.fi
 .IP
 The
 .BR pmem_memmove_nodrain (),
@@ -426,11 +433,9 @@ when copying several ranges of memory to pmem:
     /* ... write several ranges to pmem ... */
     pmem_memcpy_nodrain(pmemdest1, src1, len1);
     pmem_memcpy_nodrain(pmemdest2, src2, len2);
+
     /* ... */
 
-    /* persistent memory store barrier */
-    pmem_fence();
-	
     /* wait for any pmem stores to drain from HW buffers */
     pmem_drain();
 .fi
@@ -448,11 +453,11 @@ returns false may not do anything useful.
 This section describes how the library API is versioned,
 allowing applications to work with an evolving API.
 .PP
-.nf
 .BI "const char *pmem_check_version("
+.br
 .BI "           unsigned " major_required ,
+.br
 .BI "           unsigned " minor_required );
-.fi
 .IP
 The
 .BR pmem_check_version ()
@@ -637,7 +642,76 @@ This variable is intended for use
 during library testing.
 .SH EXAMPLES
 .PP
-See http://pmem.io/nvml/examples/pmem for examples
+The following example uses
+.B libpmem
+to flush changes made to raw, memory-mapped persistent memory.
+.PP
+WARNING: there is nothing transactional about the
+.BR pmem_persist ()
+or
+.BR pmem_msync ()
+calls in this example.  Interrupting the program may result in
+a partial write to pmem.  Use a transactional library such as
+.BR libpmemobj (3)
+to avoid torn updates.
+.IP
+.\" run source through expand -4 before inserting...
+.nf
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <libpmem.h>
+
+/* using 4k of pmem for this example */
+#define PMEM_LEN 4096
+
+int
+main(int argc, char *argv[])
+{
+    int fd;
+    char *pmemaddr;
+    int is_pmem;
+
+    /* create a pmem file */
+    if ((fd = open("/pmem-fs/myfile",
+                         O_CREAT|O_RDWR, 0666)) < 0) {
+        perror("open");
+        exit(1);
+    }
+
+    /* allocate the pmem */
+    if ((errno = posix_fallocate(fd, 0, PMEM_LEN)) != 0) {
+        perror("posix_fallocate");
+        exit(1);
+    }
+
+    /* memory map it */
+    if ((pmemaddr = pmem_map(fd)) == NULL) {
+        perror("pmem_map");
+        exit(1);
+    }
+    close(fd);
+
+    /* determine if range is true pmem */
+    is_pmem = pmem_is_pmem(pmemaddr, PMEM_LEN);
+
+    /* store a string to the persistent memory */
+    strcpy(pmemaddr, "hello, persistent memory");
+
+    /* flush above strcpy to persistence */
+    if (is_pmem)
+        pmem_persist(pmemaddr, PMEM_LEN);
+    else
+        pmem_msync(pmemaddr, PMEM_LEN);
+}
+.fi
+.PP
+See http://pmem.io/nvml/libpmem for more examples
 using the
 .B libpmem
 API.

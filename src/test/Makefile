@@ -43,15 +43,17 @@ TEST = blk_nblock\
        log_basic\
        log_recovery\
        log_walker\
-       pmem_clflush_proc\
+       pmem_isa_proc\
        pmem_is_pmem\
        pmem_is_pmem_proc\
-       pmem_map_raw\
+       pmem_map\
        scope\
        traces\
        traces_custom_function\
        traces_pmem\
        util_map_proc\
+       util_pool_create\
+       util_pool_open\
        vmem_aligned_alloc\
        vmem_calloc\
        vmem_check_allocations\
@@ -59,13 +61,14 @@ TEST = blk_nblock\
        vmem_custom_alloc\
        vmem_freespace\
        vmem_malloc\
+       vmem_malloc_usable_size\
        vmem_mix_allocations\
        vmem_multiple_pools\
        vmem_out_of_memory\
-       vmem_pool_check\
-       vmem_pool_create\
-       vmem_pool_create_error\
-       vmem_pool_create_in_region\
+       vmem_check\
+       vmem_create\
+       vmem_create_error\
+       vmem_create_in_region\
        vmem_realloc\
        vmem_stats\
        vmem_strdup\

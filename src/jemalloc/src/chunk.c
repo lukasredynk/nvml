@@ -136,13 +136,6 @@ chunk_alloc_core(pool_t *pool, size_t size, size_t alignment, bool base, bool *z
 	assert(alignment != 0);
 	assert((alignment & chunksize_mask) == 0);
 
-	/* Custom pools can only use existing chunks. */
-	if (pool->pool_id != 0) {
-		return chunk_recycle(pool,
-			&pool->chunks_szad_mmap, &pool->chunks_ad_mmap,
-			size, alignment, false, zero);
-	}
-
 	/* "primary" dss. */
 	if (have_dss && dss_prec == dss_prec_primary) {
 		if ((ret = chunk_recycle(pool, &pool->chunks_szad_dss, &pool->chunks_ad_dss, size,
@@ -209,8 +202,16 @@ chunk_alloc_base(pool_t *pool, size_t size)
 	bool zero;
 
 	zero = false;
-	ret = chunk_alloc_core(pool, size, chunksize, true, &zero,
-	    chunk_dss_prec_get());
+
+	if (pool->pool_id != 0) {
+		/* Custom pools can only use existing chunks. */
+		ret = chunk_recycle(pool, &pool->chunks_szad_mmap,
+				    &pool->chunks_ad_mmap, size,
+				    chunksize, false, &zero);
+	} else {
+		ret = chunk_alloc_core(pool, size, chunksize, true, &zero,
+				       chunk_dss_prec_get());
+	}
 	if (ret == NULL)
 		return (NULL);
 	if (chunk_register(pool, ret, size, true)) {
@@ -241,8 +242,18 @@ void *
 chunk_alloc_default(size_t size, size_t alignment, bool *zero,
     unsigned arena_ind, pool_t *pool)
 {
-	return (chunk_alloc_core(pool, size, alignment, false, zero,
-	    pool->arenas[arena_ind]->dss_prec));
+	if (pool->pool_id != 0) {
+		/* Custom pools can only use existing chunks. */
+		return (chunk_recycle(pool, &pool->chunks_szad_mmap,
+				     &pool->chunks_ad_mmap, size,
+				     alignment, false, zero));
+	} else {
+		malloc_mutex_lock(&pool->arenas_lock);
+		dss_prec_t dss_prec = pool->arenas[arena_ind]->dss_prec;
+		malloc_mutex_unlock(&pool->arenas_lock);
+		return (chunk_alloc_core(pool, size, alignment,
+					 false, zero, dss_prec));
+	}
 }
 
 void
@@ -385,13 +396,16 @@ chunk_dalloc_default(void *chunk, size_t size, unsigned arena_ind, pool_t *pool)
 	return (false);
 }
 
-void
+bool
 chunk_global_boot() {
+	if (have_dss && chunk_dss_boot())
+		return (true);
 	/* Set variables according to the value of opt_lg_chunk. */
 	chunksize = (ZU(1) << opt_lg_chunk);
 	assert(chunksize >= PAGE);
 	chunksize_mask = chunksize - 1;
 	chunk_npages = (chunksize >> LG_PAGE);	
+	return (false);
 }
 
 bool
@@ -402,8 +416,6 @@ chunk_boot(pool_t *pool)
 			return (true);
 		memset(&pool->stats_chunks, 0, sizeof(chunk_stats_t));
 	}
-	if (have_dss && chunk_dss_boot())
-		return (true);
 	extent_tree_szad_new(&pool->chunks_szad_mmap);
 	extent_tree_ad_new(&pool->chunks_ad_mmap);
 	extent_tree_szad_new(&pool->chunks_szad_dss);

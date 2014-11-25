@@ -33,7 +33,7 @@
 #
 # doc/Makefile -- Makefile for NVM library man pages
 #
-MANPAGES = libpmem.3 libvmem.3
+MANPAGES = libpmem.3 libpmemblk.3 libpmemlog.3 libpmemobj.3 libvmem.3
 TXTFILES = $(MANPAGES:=.txt)
 HTMLFILES = $(MANPAGES:=.html)
 GZFILES = $(MANPAGES:=.gz)

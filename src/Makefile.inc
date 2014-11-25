@@ -67,8 +67,8 @@ vpath %.c ..
 vpath %.h .. ../include
 INCS = -I.. -I../include
 
-CFLAGS += -std=gnu99 -Wall -Werror
-LDFLAGS = -Wl,-z,relro
+CFLAGS += -std=gnu99 -Wall -Werror $(EXTRA_CFLAGS)
+LDFLAGS += -Wl,-z,relro $(EXTRA_LDFLAGS)
 
 LN = ln
 PMEMSOVERSION = 1
@@ -123,10 +123,24 @@ EXTRA_JECONFIG =
 
 $(LIBPMEMAR) $(LIBPMEM_REALNAME): LIBS += -luuid
 $(LIBPMEMBLKAR) $(LIBPMEMLOGAR) $(LIBPMEMOBJAR): LIBS += -luuid
-$(LIBPMEMBLK_REALNAME) $(LIBPMEMOBJ_REALNAME) $(LIBPMEMLOG_REALNAME): LIBS += -luuid -l:$(LIBPMEM_REALNAME)
+$(LIBPMEMBLK_REALNAME) $(LIBPMEMOBJ_REALNAME) $(LIBPMEMLOG_REALNAME): LIBS += -luuid -l:$(LIBPMEM_REALNAME) -L.
 $(LIBVMEMAR) $(LIBVMEM_REALNAME): INCS += -I$(JEMALLOC_DIR)/include/jemalloc
 
 out.o: CFLAGS += -DSRCVERSION='"$(SRCVERSION)"'
+
+define arch32_error_msg
+
+##################################################
+###  32-bit builds of NVML are not supported!  ###
+###  Please, use 64-bit platform/compiler.     ###
+##################################################
+
+endef
+
+LP64 := $(shell $(CC) $(CFLAGS) -dM -E -x c /dev/null | grep -Ec "__SIZEOF_LONG__.+8|__SIZEOF_POINTER__.+8" )
+ifneq ($(LP64), 2)
+$(error $(arch32_error_msg))
+endif
 
 all: $(TARGETS)
 
@@ -134,7 +148,7 @@ jemalloc: $(JEMALLOC_LIB)
 
 jeconfig $(JEMALLOC_CFG_OUT_FILES): $(JEMALLOC_CFG) $(JECONFIG_FILE)
 	cd $(JEMALLOC_DIR) && \
-	CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" ./configure $(JECONFIG) $(EXTRA_JECONFIG)
+		CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" ./configure $(JECONFIG) $(EXTRA_JECONFIG)
 	@for FILE in $(JEMALLOC_CFG_OUT_FILES_REL);\
 	do\
 		mkdir -p $$(dirname $(JEMALLOC_DIR)/$(JEMALLOC_OBJROOT)/$$FILE);\

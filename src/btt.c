@@ -172,7 +172,7 @@ struct btt {
 	/* run-time state kept for each arena */
 	struct arena {
 		uint32_t flags;		/* arena flags (btt_info) */
-		uint64_t external_nlba;	/* LBAs that live in this arena */
+		uint32_t external_nlba;	/* LBAs that live in this arena */
 		uint32_t internal_lbasize;
 		uint32_t internal_nlba;
 
@@ -221,6 +221,11 @@ struct btt {
 		 * Map locking.  Indexed by pre-map LBA modulo nlane.
 		 */
 		pthread_mutex_t *map_locks;
+
+		/*
+		 * Arena info block locking.
+		 */
+		pthread_mutex_t info_lock;
 	} *arenas;
 
 	/*
@@ -299,6 +304,12 @@ read_info(struct btt_info *infop)
 		return 0;
 	}
 
+	/* to be valid, the fields must checksum correctly */
+	if (!util_checksum(infop, sizeof (*infop), &infop->checksum, 0)) {
+		LOG(3, "invalid checksum");
+		return 0;
+	}
+
 	/* to be valid, info block must have a major version of at least 1 */
 	if ((infop->major = le16toh(infop->major)) == 0) {
 		LOG(3, "invalid major version (0)");
@@ -318,13 +329,6 @@ read_info(struct btt_info *infop)
 	infop->mapoff = le64toh(infop->mapoff);
 	infop->flogoff = le64toh(infop->flogoff);
 	infop->infooff = le64toh(infop->infooff);
-	infop->checksum = le64toh(infop->checksum);
-
-	/* and to be valid, the fields must checksum correctly */
-	if (!util_checksum(infop, sizeof (*infop), &infop->checksum, 0)) {
-		LOG(3, "invalid checksum");
-		return 0;
-	}
 
 	return 1;
 }
@@ -333,8 +337,6 @@ read_info(struct btt_info *infop)
  * read_flog_pair -- (internal) load up a single flog pair
  *
  * Zero is returned on success, otherwise -1/errno.
- *
- * XXX lots of byzantine checks could be added, like range checking lbas
  */
 static int
 read_flog_pair(struct btt *bttp, int lane, struct arena *arenap,
@@ -347,6 +349,18 @@ read_flog_pair(struct btt *bttp, int lane, struct arena *arenap,
 	flog_runtimep->entries[0] = flog_off;
 	flog_runtimep->entries[1] = flog_off + sizeof (struct btt_flog);
 
+	if (lane < 0 || (lane >= bttp->nfree)) {
+		LOG(1, "invalid lane %d among nfree %d", lane, bttp->nfree);
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (flog_off == 0) {
+		LOG(1, "invalid flog offset %lu", flog_off);
+		errno = EINVAL;
+		return -1;
+	}
+
 	struct btt_flog flog_pair[2];
 	if ((*bttp->ns_cbp->nsread)(bttp->ns, lane, flog_pair,
 				sizeof (flog_pair), flog_off) < 0)
@@ -357,10 +371,16 @@ read_flog_pair(struct btt *bttp, int lane, struct arena *arenap,
 	flog_pair[0].new_map = le32toh(flog_pair[0].new_map);
 	flog_pair[0].seq = le32toh(flog_pair[0].seq);
 
+	if (invalid_lba(bttp, flog_pair[0].lba))
+		return -1;
+
 	flog_pair[1].lba = le32toh(flog_pair[1].lba);
 	flog_pair[1].old_map = le32toh(flog_pair[1].old_map);
 	flog_pair[1].new_map = le32toh(flog_pair[1].new_map);
 	flog_pair[1].seq = le32toh(flog_pair[1].seq);
+
+	if (invalid_lba(bttp, flog_pair[1].lba))
+		return -1;
 
 	LOG(6, "flog_pair[0] flog_off %lld old_map %u new_map %u seq %u",
 			(long long)flog_off, flog_pair[0].old_map,
@@ -492,16 +512,15 @@ flog_update(struct btt *bttp, int lane, struct arena *arenap,
 	off_t new_flog_off =
 		arenap->flogs[lane].entries[arenap->flogs[lane].next];
 
-	/* write out first three fields first */
-	/* XXX writing two fields and two fields will be faster */
+	/* write out first two fields first */
 	if ((*bttp->ns_cbp->nswrite)(bttp->ns, lane, &new_flog,
-				sizeof (uint32_t) * 3, new_flog_off) < 0)
+				sizeof (uint32_t) * 2, new_flog_off) < 0)
 		return -1;
-	new_flog_off += sizeof (uint32_t) * 3;
+	new_flog_off += sizeof (uint32_t) * 2;
 
-	/* write out seq field to make it active */
-	if ((*bttp->ns_cbp->nswrite)(bttp->ns, lane, &new_flog.seq,
-				sizeof (uint32_t), new_flog_off) < 0)
+	/* write out new_map and seq field to make it active */
+	if ((*bttp->ns_cbp->nswrite)(bttp->ns, lane, &new_flog.new_map,
+				sizeof (uint32_t) * 2, new_flog_off) < 0)
 		return -1;
 
 	/* flog entry written successfully, update run-time state */
@@ -523,6 +542,86 @@ flog_update(struct btt *bttp, int lane, struct arena *arenap,
 }
 
 /*
+ * arena_setf -- (internal) updates the given flag for the arena info block
+ */
+static int
+arena_setf(struct btt *bttp, struct arena *arenap, int lane, uint32_t setf)
+{
+	LOG(3, "bttp %p arenap %p lane %u setf 0x%x", bttp, arenap, lane, setf);
+
+	/* update runtime state */
+	__sync_fetch_and_or(&arenap->flags, setf);
+
+	if (!bttp->laidout) {
+		/* no layout yet to update */
+		return 0;
+	}
+
+	/*
+	 * Read, modify and write out the info block
+	 * at both the beginning and end of the arena.
+	 */
+	uint64_t arena_off = arenap->startoff;
+
+	struct btt_info info;
+
+	/* protect from simultaneous writes to the layout */
+	if ((errno = pthread_mutex_lock(&arenap->info_lock))) {
+		LOG(1, "!pthread_mutex_lock");
+		return -1;
+	}
+
+	int oerrno;
+
+	if ((*bttp->ns_cbp->nsread)(bttp->ns, lane, &info,
+			sizeof (info), arena_off) < 0) {
+		goto err;
+	}
+
+	uint64_t infooff = le64toh(info.infooff);
+
+	/* update flags */
+	info.flags |= htole32(setf);
+
+	/* update checksum */
+	util_checksum(&info, sizeof (info), &info.checksum, 1);
+
+	if ((*bttp->ns_cbp->nswrite)(bttp->ns, lane, &info,
+				sizeof (info), arena_off) < 0) {
+		goto err;
+	}
+
+	if ((*bttp->ns_cbp->nswrite)(bttp->ns, lane, &info,
+				sizeof (info), arena_off + infooff) < 0) {
+		goto err;
+	}
+
+	oerrno = errno;
+	if ((errno = pthread_mutex_unlock(&arenap->info_lock)))
+		LOG(1, "!pthread_mutex_unlock");
+	errno = oerrno;
+	return 0;
+
+err:
+	oerrno = errno;
+	if ((errno = pthread_mutex_unlock(&arenap->info_lock)))
+		LOG(1, "!pthread_mutex_unlock");
+	errno = oerrno;
+	return -1;
+}
+
+/*
+ * set_arena_error -- (internal) set the error flag for the given arena
+ */
+static int
+set_arena_error(struct btt *bttp, struct arena *arenap, int lane)
+{
+	LOG(3, "bttp %p arena %p lane %u", bttp, arenap, lane);
+
+	return arena_setf(bttp, arenap, lane, BTTINFO_FLAG_ERROR);
+}
+
+/*
  * read_flogs -- (internal) load up all the flog entries for an arena
  *
  * Zero is returned on success, otherwise -1/errno.
@@ -540,14 +639,17 @@ read_flogs(struct btt *bttp, int lane, struct arena *arenap)
 	/*
 	 * Load up the flog state.  read_flog_pair() will determine if
 	 * any recovery steps are required take them on the in-memory
-	 * data structures it creates.
+	 * data structures it creates. Sets error flag when it
+	 * determines an invalid state.
 	 */
 	off_t flog_off = arenap->flogoff;
 	struct flog_runtime *flog_runtimep = arenap->flogs;
 	for (int i = 0; i < bttp->nfree; i++) {
 		if (read_flog_pair(bttp, lane, arenap, flog_off,
-						flog_runtimep, i) < 0)
+						flog_runtimep, i) < 0) {
+			set_arena_error(bttp, arenap, lane);
 			return -1;
+		}
 
 		/* prepare for next time around the loop */
 		flog_off += roundup(2 * sizeof (struct btt_flog),
@@ -619,7 +721,7 @@ read_arena(struct btt *bttp, int lane, off_t arena_off, struct arena *arenap)
 		return -1;
 
 	arenap->flags = le32toh(info.flags);
-	arenap->external_nlba = le64toh(info.external_nlba);
+	arenap->external_nlba = le32toh(info.external_nlba);
 	arenap->internal_lbasize = le32toh(info.internal_lbasize);
 	arenap->internal_nlba = le32toh(info.internal_nlba);
 
@@ -637,6 +739,9 @@ read_arena(struct btt *bttp, int lane, off_t arena_off, struct arena *arenap)
 
 	if (build_map_locks(bttp, arenap) < 0)
 		return -1;
+
+	/* initialize the per arena info block lock */
+	pthread_mutex_init(&arenap->info_lock, NULL);
 
 	return 0;
 }
@@ -733,10 +838,17 @@ write_layout(struct btt *bttp, int lane, int write)
 	flog_size = roundup(flog_size, BTT_ALIGNMENT);
 
 	uint32_t internal_lbasize = bttp->lbasize;
-	if (internal_lbasize < BTT_MIN_LBA)
-		internal_lbasize = BTT_MIN_LBA;
+	if (internal_lbasize < BTT_MIN_LBA_SIZE)
+		internal_lbasize = BTT_MIN_LBA_SIZE;
 	internal_lbasize =
 		roundup(internal_lbasize, BTT_INTERNAL_LBA_ALIGNMENT);
+	/* check for overflow */
+	if (internal_lbasize < BTT_INTERNAL_LBA_ALIGNMENT) {
+		errno = EINVAL;
+		LOG(1, "!Invalid lba size after alignment: %u ",
+				internal_lbasize);
+		return -1;
+	}
 	LOG(4, "adjusted internal_lbasize %u", internal_lbasize);
 
 	uint64_t total_nlba = 0;
@@ -764,6 +876,16 @@ write_layout(struct btt *bttp, int lane, int write)
 		/* allow for map alignment padding */
 		uint64_t internal_nlba = (arena_datasize - BTT_ALIGNMENT) /
 			(internal_lbasize + BTT_MAP_ENTRY_SIZE);
+
+		/* ensure the number of blocks is at least 2*nfree */
+		if (internal_nlba < 2 * bttp->nfree) {
+			errno = EINVAL;
+			LOG(1, "!number of internal blocks: %lu "
+					"expected at least %u",
+					internal_nlba, 2 * bttp->nfree);
+			return -1;
+		}
+
 		uint64_t external_nlba = internal_nlba - bttp->nfree;
 
 		LOG(4, "internal_nlba %ju external_nlba %ju",
@@ -953,7 +1075,7 @@ write_layout(struct btt *bttp, int lane, int write)
  * Returns 0 if no errors are encountered accessing the namespace (in this
  * context, detecting there's no layout is not an error if the nsread function
  * didn't have any problems doing the reads).  Otherwise, -1 is returned
- * and errno is set (by nsread).
+ * and errno is set.
  */
 static int
 read_layout(struct btt *bttp, int lane)
@@ -991,6 +1113,30 @@ read_layout(struct btt *bttp, int lane)
 			 */
 			return write_layout(bttp, lane, 0);
 		}
+		if (info.external_lbasize != bttp->lbasize) {
+			/* can't read it assuming the wrong block size */
+			LOG(1, "inconsistent lbasize");
+			errno = EINVAL;
+			return -1;
+		}
+
+		if (info.nfree == 0) {
+			LOG(1, "invalid nfree");
+			errno = EINVAL;
+			return -1;
+		}
+
+		if (info.external_nlba == 0) {
+			LOG(1, "invalid external_nlba");
+			errno = EINVAL;
+			return -1;
+		}
+
+		if (info.nextoff && (info.nextoff != BTT_MAX_ARENA)) {
+			LOG(1, "invalid arena size");
+			errno = EINVAL;
+			return -1;
+		}
 
 		if (info.nfree < smallest_nfree)
 			smallest_nfree = info.nfree;
@@ -999,6 +1145,11 @@ read_layout(struct btt *bttp, int lane)
 		arena_off += info.nextoff;
 		if (info.nextoff == 0)
 			break;
+		if (info.nextoff > rawsize) {
+			LOG(1, "invalid next arena offset");
+			errno = EINVAL;
+			return -1;
+		}
 		rawsize -= info.nextoff;
 	}
 
@@ -1008,7 +1159,8 @@ read_layout(struct btt *bttp, int lane)
 	bttp->nlba = total_nlba;
 
 	/*
-	 * All arenas were valid.  nfree should be the smallest value found.
+	 * All arenas were valid.  nfree should be the smallest value found
+	 * among different arenas.
 	 */
 	if (smallest_nfree < bttp->nfree)
 		bttp->nfree = smallest_nfree;
@@ -1073,10 +1225,11 @@ lba_to_arena_lba(struct btt *bttp, uint64_t lba,
  *
  * Returns handle on success, otherwise NULL/errno.
  *
- * XXX handle case where lbasize doesn't match lbasize found in valid arenas.
- * XXX check rawsize against size from valid arenas.
- * XXX what if write_layout produces something read_layout says is invalid?
- * XXX what if arenas have different nfree?
+ * When submitted a pristine namespace it will be formatted implicitly when
+ * touched for the first time.
+ *
+ * If arenas have different nfree values, we will be using the lowest one
+ * found as limiting to the overall "bandwidth".
  */
 struct btt *
 btt_init(uint64_t rawsize, uint32_t lbasize, uint8_t parent_uuid[],
@@ -1293,7 +1446,11 @@ map_lock(struct btt *bttp, int lane, struct arena *arenap,
 	/* read the old map entry */
 	if ((*bttp->ns_cbp->nsread)(bttp->ns, lane, entryp,
 				sizeof (uint32_t), map_entry_off) < 0) {
-		pthread_mutex_unlock(&arenap->map_locks[map_lock_num]);
+		int oerrno = errno;
+		if ((errno = pthread_mutex_unlock(
+					&arenap->map_locks[map_lock_num])))
+			LOG(1, "!pthread_mutex_unlock");
+		errno = oerrno;
 		return -1;
 	}
 
@@ -1316,7 +1473,10 @@ map_abort(struct btt *bttp, int lane, struct arena *arenap, uint32_t premap_lba)
 
 	int map_lock_num = premap_lba * BTT_MAP_ENTRY_SIZE / BTT_MAP_LOCK_ALIGN
 		% bttp->nfree;
-	pthread_mutex_unlock(&arenap->map_locks[map_lock_num]);
+	int oerrno = errno;
+	if ((errno = pthread_mutex_unlock(&arenap->map_locks[map_lock_num])))
+		LOG(1, "!pthread_mutex_unlock");
+	errno = oerrno;
 }
 
 /*
@@ -1337,7 +1497,11 @@ map_unlock(struct btt *bttp, int lane, struct arena *arenap,
 
 	int map_lock_num = premap_lba * BTT_MAP_ENTRY_SIZE / BTT_MAP_LOCK_ALIGN
 		% bttp->nfree;
-	pthread_mutex_unlock(&arenap->map_locks[map_lock_num]);
+
+	int oerrno = errno;
+	if ((errno = pthread_mutex_unlock(&arenap->map_locks[map_lock_num])))
+		LOG(1, "!pthread_mutex_unlock");
+	errno = oerrno;
 
 	LOG(9, "unlocked map[%d]: %u%s%s", premap_lba,
 			entry & BTT_MAP_ENTRY_LBA_MASK,
@@ -1370,7 +1534,11 @@ btt_write(struct btt *bttp, int lane, uint64_t lba, const void *buf)
 		}
 		if (!bttp->laidout)
 			err = write_layout(bttp, lane, 1);
-		pthread_mutex_unlock(&bttp->layout_write_mutex);
+
+		int oerrno = errno;
+		if ((errno = pthread_mutex_unlock(&bttp->layout_write_mutex)))
+			LOG(1, "!pthread_mutex_unlock");
+		errno = oerrno;
 
 		if (err < 0)
 			return err;
@@ -1436,7 +1604,12 @@ btt_write(struct btt *bttp, int lane, uint64_t lba, const void *buf)
 
 	if (map_unlock(bttp, lane, arenap, htole32(free_entry),
 					premap_lba) < 0) {
-		/* XXX retry? revert the flog? */
+		/*
+		 * A critical write error occurred, set the arena's
+		 * info block error bit.
+		 */
+		set_arena_error(bttp, arenap, lane);
+		errno = EIO;
 		return -1;
 	}
 
@@ -1476,7 +1649,11 @@ map_entry_setf(struct btt *bttp, int lane, uint64_t lba, uint32_t setf)
 		}
 		if (!bttp->laidout)
 			err = write_layout(bttp, lane, 1);
-		pthread_mutex_unlock(&bttp->layout_write_mutex);
+
+		int oerrno = errno;
+		if ((errno = pthread_mutex_unlock(&bttp->layout_write_mutex)))
+			LOG(1, "!pthread_mutex_unlock");
+		errno = oerrno;
 
 		if (err < 0)
 			return err;
@@ -1602,6 +1779,13 @@ check_arena(struct btt *bttp, struct arena *arenap)
 				(entry & BTT_MAP_ENTRY_ZERO) ? " ZERO" : "");
 
 		entry &= BTT_MAP_ENTRY_LBA_MASK;
+
+		/* check if entry is valid */
+		if (entry >= arenap->internal_nlba) {
+			LOG(1, "map[%d] entry out of bounds: %u", i, entry);
+			errno = EINVAL;
+			return -1;
+		}
 
 		if (isset(bitmap, entry)) {
 			LOG(1, "map[%d] duplicate entry: %u", i, entry);

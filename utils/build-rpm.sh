@@ -89,6 +89,8 @@ SOURCE=$PACKAGE_NAME
 PACKAGE_TARBALL=$PACKAGE_SOURCE.tar.gz
 RPM_SPEC_FILE=$PACKAGE_SOURCE/$PACKAGE_NAME.spec
 CHANGELOG_FILE=$PACKAGE_SOURCE/ChangeLog
+MAGIC_INSTALL=$PACKAGE_SOURCE/utils/magic-install.sh
+MAGIC_UNINSTALL=$PACKAGE_SOURCE/utils/magic-uninstall.sh
 OLDPWD=$PWD
 
 [ -d $WORKING_DIR ] || mkdir -v $WORKING_DIR
@@ -142,6 +144,13 @@ NVML libpmem library
 %files -n libpmem
 %defattr(-,root,root,-)
 %{_libdir}/libpmem.so.*
+/usr/share/nvml/nvml.magic
+
+%post -n libpmem
+$(cat $MAGIC_INSTALL | sed '/^#/d')
+
+%preun -n libpmem
+$(cat $MAGIC_UNINSTALL | sed '/^#/d')
 
 %package -n libpmem-devel
 Summary: libpmem development library
@@ -183,7 +192,7 @@ Development files for NVML libpmemblk library
 %{_libdir}/nvml_debug/libpmemblk.so.*
 %{_libdir}/nvml_debug/libpmemblk.a
 /usr/include/libpmemblk.h
-#/usr/share/man/man3/libpmemblk.3.gz
+/usr/share/man/man3/libpmemblk.3.gz
 
 %package -n libpmemlog
 Summary: libpmemlog library
@@ -209,7 +218,7 @@ Development files for NVML libpmemlog library
 %{_libdir}/nvml_debug/libpmemlog.so.*
 %{_libdir}/nvml_debug/libpmemlog.a
 /usr/include/libpmemlog.h
-#/usr/share/man/man3/libpmemlog.3.gz
+/usr/share/man/man3/libpmemlog.3.gz
 
 %package -n libpmemobj
 Summary: libpmemobj library
@@ -235,7 +244,7 @@ Development files for NVML libpmemobj library
 %{_libdir}/nvml_debug/libpmemobj.so.*
 %{_libdir}/nvml_debug/libpmemobj.a
 /usr/include/libpmemobj.h
-#/usr/share/man/man3/libpmemobj.3.gz
+/usr/share/man/man3/libpmemobj.3.gz
 
 %package -n libvmem
 Summary: libvmem library
@@ -272,6 +281,8 @@ Development files for NVML libvmem library
 %install
 rm -rf %{buildroot}
 make install DESTDIR=%{buildroot}
+mkdir -p %{buildroot}/usr/share/nvml
+cp utils/nvml.magic %{buildroot}/usr/share/nvml/
 
 %check
 cp src/test/testconfig.sh.example src/test/testconfig.sh

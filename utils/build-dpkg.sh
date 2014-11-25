@@ -78,6 +78,8 @@ PACKAGE_VERSION=$(get_version $PACKAGE_VERSION_TAG)
 PACKAGE_RELEASE=1
 PACKAGE_SOURCE=${PACKAGE_NAME}-${PACKAGE_VERSION}
 PACKAGE_TARBALL_ORIG=${PACKAGE_NAME}_${PACKAGE_VERSION}.orig.tar.gz
+MAGIC_INSTALL=utils/magic-install.sh
+MAGIC_UNINSTALL=utils/magic-uninstall.sh
 
 [ -d $WORKING_DIR ] || mkdir $WORKING_DIR
 [ -d $OUT_DIR ] || mkdir $OUT_DIR
@@ -194,6 +196,11 @@ cat << EOF > debian/rules
 override_dh_strip:
 	dh_strip --dbg-package=$PACKAGE_NAME-dbg
 
+override_dh_install:
+	mkdir -p debian/tmp/usr/share/nvml/
+	cp utils/nvml.magic debian/tmp/usr/share/nvml/
+	dh_install
+
 override_dh_auto_test:
 	dh_auto_test
 	cp src/test/testconfig.sh.example src/test/testconfig.sh
@@ -214,7 +221,11 @@ EOF
 
 cat << EOF > debian/libpmem.install
 usr/lib/libpmem.so.*
+usr/share/nvml/nvml.magic
 EOF
+
+cat $MAGIC_INSTALL > debian/libpmem.postinst
+cat $MAGIC_UNINSTALL > debian/libpmem.prerm
 
 cat << EOF > debian/libpmem.lintian-overrides
 $ITP_BUG_EXCUSE
@@ -262,7 +273,7 @@ usr/lib/nvml_debug/libpmemblk.so usr/lib/nvml_dbg/
 usr/lib/nvml_debug/libpmemblk.so.* usr/lib/nvml_dbg/
 usr/lib/libpmemblk.so
 usr/include/libpmemblk.h
-#usr/share/man/man3/libpmemblk.3.gz
+usr/share/man/man3/libpmemblk.3.gz
 EOF
 
 cat << EOF > debian/libpmemblk-dev.triggers
@@ -296,7 +307,7 @@ usr/lib/nvml_debug/libpmemlog.so usr/lib/nvml_dbg/
 usr/lib/nvml_debug/libpmemlog.so.* usr/lib/nvml_dbg/
 usr/lib/libpmemlog.so
 usr/include/libpmemlog.h
-#usr/share/man/man3/libpmemlog.3.gz
+usr/share/man/man3/libpmemlog.3.gz
 EOF
 
 cat << EOF > debian/libpmemlog-dev.triggers
@@ -330,7 +341,7 @@ usr/lib/nvml_debug/libpmemobj.so usr/lib/nvml_dbg/
 usr/lib/nvml_debug/libpmemobj.so.* usr/lib/nvml_dbg/
 usr/lib/libpmemobj.so
 usr/include/libpmemobj.h
-#usr/share/man/man3/libpmemobj.3.gz
+usr/share/man/man3/libpmemobj.3.gz
 EOF
 
 cat << EOF > debian/libpmemobj-dev.triggers

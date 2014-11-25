@@ -39,8 +39,8 @@ libpmem.so {
 		pmem_persist;
 		pmem_msync;
 		pmem_flush;
-		pmem_fence;
 		pmem_drain;
+		pmem_has_hw_drain;
 		pmem_check_version;
 		pmem_memmove;
 		pmem_memcpy;
