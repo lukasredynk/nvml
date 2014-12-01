@@ -389,6 +389,7 @@ extern pool_t	*pools[POOLS_MAX];
 extern malloc_mutex_t	pools_lock;
 extern void	*(*je_base_malloc)(size_t);
 extern void	(*je_base_free)(void *);
+extern bool	pools_shared_data_create(void);
 
 arena_t	*arenas_extend(pool_t *pool, unsigned ind);
 void	arenas_cleanup(void *arg);
@@ -575,9 +576,9 @@ JEMALLOC_INLINE unsigned
 narenas_total_get(pool_t *pool)
 {
 	unsigned narenas;
-	malloc_mutex_lock(&pool->arenas_lock);
+	malloc_rwlock_rdlock(&pool->arenas_lock);
 	narenas = pool->narenas_total;
-	malloc_mutex_unlock(&pool->arenas_lock);
+	malloc_rwlock_unlock(&pool->arenas_lock);
 
 	return (narenas);
 }
@@ -831,6 +832,7 @@ u2rz(size_t usize)
 
 	if (usize <= SMALL_MAXCLASS) {
 		size_t binind = small_size2bin(usize);
+		assert(binind < NBINS);
 		ret = arena_bin_info[binind].redzone_size;
 	} else
 		ret = 0;

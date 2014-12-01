@@ -13,7 +13,7 @@ bool pool_new(pool_t *pool, unsigned pool_id)
 		return (true);
 	}
 
-	if (malloc_mutex_init(&pool->arenas_lock)) {
+	if (malloc_rwlock_init(&pool->arenas_lock)) {
 		return (true);
 	}
 
@@ -26,6 +26,10 @@ bool pool_new(pool_t *pool, unsigned pool_id)
 	}
 
 	if (huge_boot(pool)) {
+		return (true);
+	}
+
+	if (pools_shared_data_create()) {
 		return (true);
 	}
 
@@ -69,6 +73,7 @@ void pool_destroy(pool_t *pool)
 			arena_purge_all(pool->arenas[i]);
 		}
 	}
+	malloc_rwlock_destroy(&pool->arenas_lock);
 }
 
 bool pool_boot()

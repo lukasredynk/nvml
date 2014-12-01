@@ -126,7 +126,6 @@ typedef struct {
 
 static bool	malloc_init_hard(void);
 static bool	malloc_init_base_pool(void);
-static bool	pools_shared_data_create(void);
 static void	*base_malloc_default(size_t size);
 static void	base_free_default(void *ptr);
 
@@ -173,7 +172,7 @@ choose_arena_hard(pool_t *pool)
 
 		choose = 0;
 		first_null = pool->narenas_auto;
-		malloc_mutex_lock(&pool->arenas_lock);
+		malloc_rwlock_wrlock(&pool->arenas_lock);
 		assert(pool->arenas[0] != NULL);
 		for (i = 1; i < pool->narenas_auto; i++) {
 			if (pool->arenas[i] != NULL) {
@@ -210,12 +209,12 @@ choose_arena_hard(pool_t *pool)
 			ret = arenas_extend(pool, first_null);
 		}
 		ret->nthreads++;
-		malloc_mutex_unlock(&pool->arenas_lock);
+		malloc_rwlock_unlock(&pool->arenas_lock);
 	} else {
 		ret = pool->arenas[0];
-		malloc_mutex_lock(&pool->arenas_lock);
+		malloc_rwlock_wrlock(&pool->arenas_lock);
 		ret->nthreads++;
-		malloc_mutex_unlock(&pool->arenas_lock);
+		malloc_rwlock_unlock(&pool->arenas_lock);
 	}
 
 	tsd = arenas_tsd_get();
@@ -304,9 +303,9 @@ arenas_cleanup(void *arg)
 		pool = pools[i];
 		if (pool != NULL) {
 			if (pool->seqno == tsd->seqno[i] && tsd->arenas[i] != NULL) {
-				malloc_mutex_lock(&pool->arenas_lock);
+				malloc_rwlock_wrlock(&pool->arenas_lock);
 				tsd->arenas[i]->nthreads--;
-				malloc_mutex_unlock(&pool->arenas_lock);
+				malloc_rwlock_unlock(&pool->arenas_lock);
 			}
 		}
 	}
@@ -341,7 +340,7 @@ malloc_init_base_pool(void)
 	if (base_pool_initialized)
 		return (false);
 
-	if (malloc_initialized == false && malloc_init_hard())
+	if (malloc_init())
 		return (true);
 
 	malloc_mutex_lock(&pool_base_lock);
@@ -358,8 +357,6 @@ malloc_init_base_pool(void)
 	npools++;
 	pools[0] = base_pool;
 	pools[0]->seqno = ++pool_seqno;
-
-	pools_shared_data_create();
 
 	if (pool_new(base_pool, 0)) {
 		malloc_mutex_unlock(&pool_base_lock);
@@ -1407,10 +1404,10 @@ base_free_default(void *ptr)
 
 }
 
-static bool
+bool
 pools_shared_data_create(void)
 {
-	if (malloc_initialized == false && malloc_init_hard())
+	if (malloc_init())
 		return (true);
 
 	assert(je_base_malloc != base_malloc_default || pools[0] != NULL);
@@ -1441,6 +1438,9 @@ void pools_shared_data_destroy(void)
 pool_t *
 je_pool_create(void *addr, size_t size, int zeroed)
 {
+	if (malloc_init())
+		return (NULL);
+
 	if (addr == NULL || size < POOL_MINIMAL_SIZE)
 		return NULL;
 
@@ -1474,11 +1474,6 @@ je_pool_create(void *addr, size_t size, int zeroed)
 	if (pool_id == POOLS_MAX) {
 		malloc_mutex_unlock(&pools_lock);
 		malloc_printf("<jemalloc>: Too many pools\n");
-		return NULL;
-	}
-
-	if (pools_shared_data_create()) {
-		malloc_mutex_unlock(&pools_lock);
 		return NULL;
 	}
 
@@ -1585,7 +1580,7 @@ je_pool_freespace(pool_t *pool)
 {
 	size_t size = 0;
 	malloc_mutex_lock(&pool->chunks_mtx);
-	malloc_mutex_lock(&pool->arenas_lock);
+	malloc_rwlock_wrlock(&pool->arenas_lock);
 	extent_tree_szad_iter(&pool->chunks_szad_mmap, NULL, tree_binary_iter_cb, (void *)&size);
 
 	for (size_t i = 0; i < pool->narenas_total; ++i) {
@@ -1602,7 +1597,7 @@ je_pool_freespace(pool_t *pool)
 		}
 	}
 
-	malloc_mutex_unlock(&pool->arenas_lock);
+	malloc_rwlock_unlock(&pool->arenas_lock);
 	malloc_mutex_unlock(&pool->chunks_mtx);
 	return size;
 }
@@ -1802,7 +1797,7 @@ je_pool_check(pool_t *pool)
 	arg_cb.error = 0;
 
 	malloc_mutex_lock(&pool->chunks_mtx);
-	malloc_mutex_lock(&pool->arenas_lock);
+	malloc_rwlock_wrlock(&pool->arenas_lock);
 	extent_tree_szad_iter(&pool->chunks_szad_mmap, NULL,
 		check_tree_binary_iter_cb, &arg_cb);
 
@@ -1837,7 +1832,7 @@ je_pool_check(pool_t *pool)
 		}
 	}
 
-	malloc_mutex_unlock(&pool->arenas_lock);
+	malloc_rwlock_unlock(&pool->arenas_lock);
 	malloc_mutex_unlock(&pool->chunks_mtx);
 
 	malloc_mutex_unlock(&pool->memory_range_mtx);
@@ -2113,7 +2108,7 @@ pool_ifree(pool_t *pool, void *ptr)
 
 	chunk = (arena_chunk_t *)CHUNK_ADDR2BASE(ptr);
 	if (chunk != ptr)
-		arena_dalloc(chunk, ptr, false);
+		arena_dalloc(chunk, ptr, true);
 	else
 		huge_dalloc(pool, ptr);
 
@@ -2434,7 +2429,9 @@ je_mallocx(size_t size, int flags)
 		goto label_oom;
 
 	if (arena_ind != UINT_MAX) {
+		malloc_rwlock_rdlock(&pool->arenas_lock);
 		arena = pool->arenas[arena_ind];
+		malloc_rwlock_unlock(&pool->arenas_lock);
 		try_tcache = false;
 	} else {
 		arena = &dummy_arena;
@@ -2815,20 +2812,12 @@ int
 je_mallctl(const char *name, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen)
 {
-
-	if (malloc_init_base_pool())
-		return (EAGAIN);
-
 	return (ctl_byname(name, oldp, oldlenp, newp, newlen));
 }
 
 int
 je_mallctlnametomib(const char *name, size_t *mibp, size_t *miblenp)
 {
-
-	if (malloc_init_base_pool())
-		return (EAGAIN);
-
 	return (ctl_nametomib(name, mibp, miblenp));
 }
 
@@ -2836,10 +2825,6 @@ int
 je_mallctlbymib(const size_t *mib, size_t miblen, void *oldp, size_t *oldlenp,
   void *newp, size_t newlen)
 {
-
-	if (malloc_init_base_pool())
-		return (EAGAIN);
-
 	return (ctl_bymib(mib, miblen, oldp, oldlenp, newp, newlen));
 }
 

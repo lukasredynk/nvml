@@ -50,7 +50,7 @@ static int	n##_ctl(const size_t *mib, size_t miblen, void *oldp,	\
 static const ctl_named_node_t	*n##_index(const size_t *mib,		\
     size_t miblen, size_t i);
 
-static bool	ctl_arena_init(ctl_arena_stats_t *astats);
+static bool	ctl_arena_init(pool_t *pool, ctl_arena_stats_t *astats);
 static void	ctl_arena_clear(ctl_arena_stats_t *astats);
 static void	ctl_arena_stats_amerge(ctl_arena_stats_t *cstats,
     arena_t *arena);
@@ -467,9 +467,8 @@ static const ctl_named_node_t super_root_node[] = {
 /******************************************************************************/
 
 static bool
-ctl_arena_init(ctl_arena_stats_t *astats)
+ctl_arena_init(pool_t *pool, ctl_arena_stats_t *astats)
 {
-	pool_t *pool = pools[0];
 	if (astats->lstats == NULL) {
 		astats->lstats = (malloc_large_stats_t *)base_alloc(pool, nlclasses *
 		    sizeof(malloc_large_stats_t));
@@ -611,7 +610,7 @@ ctl_grow(pool_t *pool)
 	memcpy(astats, pool->ctl_stats.arenas, (pool->ctl_stats.narenas + 1) *
 	    sizeof(ctl_arena_stats_t));
 	memset(&astats[pool->ctl_stats.narenas + 1], 0, sizeof(ctl_arena_stats_t));
-	if (ctl_arena_init(&astats[pool->ctl_stats.narenas + 1])) {
+	if (ctl_arena_init(pool, &astats[pool->ctl_stats.narenas + 1])) {
 		idalloc(tarenas);
 		idalloc(astats);
 		return (true);
@@ -638,13 +637,13 @@ ctl_grow(pool_t *pool)
 		 * point to them).  Therefore, array copying must happen under
 		 * the protection of arenas_lock.
 		 */
-		malloc_mutex_lock(&pool->arenas_lock);
+		malloc_rwlock_wrlock(&pool->arenas_lock);
 		pool->arenas = tarenas;
 		memcpy(pool->arenas, arenas_old, pool->ctl_stats.narenas *
 		    sizeof(arena_t *));
 		pool->narenas_total++;
 		arenas_extend(pool, pool->narenas_total - 1);
-		malloc_mutex_unlock(&pool->arenas_lock);
+		malloc_rwlock_unlock(&pool->arenas_lock);
 		/*
 		 * Deallocate arenas_old only if it came from imalloc() (not
 		 * base_alloc()).
@@ -679,7 +678,7 @@ ctl_refresh_pool(pool_t *pool)
 	pool->ctl_stats.arenas[pool->ctl_stats.narenas].nthreads = 0;
 	ctl_arena_clear(&pool->ctl_stats.arenas[pool->ctl_stats.narenas]);
 
-	malloc_mutex_lock(&pool->arenas_lock);
+	malloc_rwlock_wrlock(&pool->arenas_lock);
 	memcpy(tarenas, pool->arenas, sizeof(arena_t *) * pool->ctl_stats.narenas);
 	for (i = 0; i < pool->ctl_stats.narenas; i++) {
 		if (pool->arenas[i] != NULL)
@@ -687,7 +686,7 @@ ctl_refresh_pool(pool_t *pool)
 		else
 			pool->ctl_stats.arenas[i].nthreads = 0;
 	}
-	malloc_mutex_unlock(&pool->arenas_lock);
+	malloc_rwlock_unlock(&pool->arenas_lock);
 	for (i = 0; i < pool->ctl_stats.narenas; i++) {
 		bool initialized = (tarenas[i] != NULL);
 
@@ -748,7 +747,7 @@ ctl_init_pool(pool_t *pool)
 	if (config_stats) {
 		unsigned i;
 		for (i = 0; i <= pool->ctl_stats.narenas; i++) {
-			if (ctl_arena_init(&pool->ctl_stats.arenas[i])) {
+			if (ctl_arena_init(pool, &pool->ctl_stats.arenas[i])) {
 				ret = true;
 				goto label_return;
 			}
@@ -1274,17 +1273,17 @@ thread_arena_ctl(const size_t *mib, size_t miblen, void *oldp, size_t *oldlenp,
 		}
 
 		/* Initialize arena if necessary. */
-		malloc_mutex_lock(&pool->arenas_lock);
+		malloc_rwlock_wrlock(&pool->arenas_lock);
 		if ((arena = pool->arenas[newind]) == NULL && (arena =
 		    arenas_extend(pool, newind)) == NULL) {
-			malloc_mutex_unlock(&pool->arenas_lock);
+			malloc_rwlock_unlock(&pool->arenas_lock);
 			ret = EAGAIN;
 			goto label_return;
 		}
 		assert(arena == pool->arenas[newind]);
 		pool->arenas[oldind]->nthreads--;
 		pool->arenas[newind]->nthreads++;
-		malloc_mutex_unlock(&pool->arenas_lock);
+		malloc_rwlock_unlock(&pool->arenas_lock);
 
 		/* Set new arena association. */
 		if (config_tcache) {
@@ -1373,9 +1372,9 @@ arena_purge(pool_t *pool, unsigned arena_ind)
 {
 	VARIABLE_ARRAY(arena_t *, tarenas, pool->ctl_stats.narenas);
 
-	malloc_mutex_lock(&pool->arenas_lock);
+	malloc_rwlock_wrlock(&pool->arenas_lock);
 	memcpy(tarenas, pool->arenas, sizeof(arena_t *) * pool->ctl_stats.narenas);
-	malloc_mutex_unlock(&pool->arenas_lock);
+	malloc_rwlock_unlock(&pool->arenas_lock);
 
 	if (arena_ind == pool->ctl_stats.narenas) {
 		unsigned i;
